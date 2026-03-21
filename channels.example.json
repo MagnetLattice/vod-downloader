@@ -1,0 +1,20 @@
+[
+    {
+        "username": "streamer_login_name",
+        "user_id": "123456789",
+        "output_folder": "C:/VODs/my_smp",
+        "youtube_playlist_id": "PLxxxxxxxxxxxxxxxxxx",
+        "audio_language": "en"
+    },
+    {
+        "username": "another_streamer",
+        "user_id": "987654321",
+        "output_folder": "C:/VODs/my_smp",
+        "youtube_playlist_id": "PLxxxxxxxxxxxxxxxxxx"
+    },
+    {
+        "username": "download_only_streamer",
+        "user_id": "111222333",
+        "output_folder": "C:/VODs/my_smp"
+    }
+]

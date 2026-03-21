@@ -1,0 +1,7 @@
+config.ini
+client_secrets.json
+youtube_token.json
+twitch_token.json
+__pycache__/
+*.pyc
+channels.json

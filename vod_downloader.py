@@ -27,7 +27,7 @@ import time
 import urllib.parse
 import webbrowser
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -59,6 +59,10 @@ TWITCH_REDIRECT_PORT = 17563  # fixed port; must match Twitch app's redirect URI
 TWITCH_USER_TOKEN_FILE = "twitch_token.json"
 YT_SCOPES = ["https://www.googleapis.com/auth/youtube"]
 
+NOBLEJURY_URL = "https://archive.nova.noblejury.com/mc/"
+# Estimation: 11 hours of stream ≈ 9.5 GiB
+BYTES_PER_SECOND_ESTIMATE = 9.5 * 1024**3 / (11 * 3600)
+
 MAX_RETRIES = 5
 BACKOFF = 2
 TIMEOUT = 30
@@ -68,12 +72,15 @@ CSV_FIELDS = [
     "upload_status",
     "stream_datetime",
     "muted_segments",
+    "deleted",
     "streamer_name",
     "stream_title",
     "stream_url",
+    "noblejury_url",
     "stream_duration",
     "vod_section",
     "vod_filename",
+    "noblejury_filename",
     "vod_title",
     "vod_description",
     "vod_url",
@@ -176,6 +183,104 @@ def make_description(name, dt, title, part=None, parts=None):
     return sanitize(desc)
 
 
+def make_capture_filename(date, name, order, day_total, part=None, parts=None):
+    """
+    Build capture VOD filename.
+    Format: YYYY-MM-DD - name[ - #][ - part_#_of_#] - capture.mp4
+    """
+    s = f"{date} - {name}"
+    if day_total > 1:
+        s += f" - {order}"
+    if part is not None and parts is not None and parts > 1:
+        s += f" - part_{part}_of_{parts}"
+    return s + " - capture.mp4"
+
+
+def make_capture_description(name, dt, title, part=None, parts=None,
+                             is_deleted=False):
+    """Build YouTube description for a NobleJury capture."""
+    d = f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+    desc = f"Originally streamed on https://www.twitch.tv/{name} on {d}."
+    if is_deleted:
+        desc += " This stream was deleted from Twitch; this is a live capture."
+    else:
+        desc += " This is an unmuted live capture of the stream."
+    if part and parts and parts > 1:
+        desc += f" This is part {part} of {parts}."
+    desc += f' The stream was originally titled "{title}"'
+    desc += (
+        "\n\nThis is not my VOD; I am posting it here for archival purposes. "
+        "This account is not monetized. If a content creator would like me to "
+        "stop uploading their VODs or otherwise credit them differently, "
+        "please feel free to contact me."
+    )
+    return sanitize(desc)
+
+
+def _parse_size(s):
+    """Parse a human-readable file size like '2.4 GiB' to bytes."""
+    m = re.match(r"([\d.]+)\s*(GiB|MiB|KiB|B)", s.strip())
+    if not m:
+        return 0
+    val = float(m.group(1))
+    mult = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3}
+    return int(val * mult.get(m.group(2), 1))
+
+
+def _has_muting(muted_str):
+    """Check if a muted_segments CSV value indicates muting."""
+    if not muted_str or muted_str == "No":
+        return False
+    return True  # "Yes" or JSON data
+
+
+def _parse_muted_segments(muted_str):
+    """
+    Parse the muted_segments CSV field.
+    Returns list of {offset, duration} dicts, empty list if "Yes" (no detail),
+    or None if no muting / unknown.
+    """
+    if not muted_str or muted_str == "No":
+        return None
+    if muted_str == "Yes":
+        return []  # muted but detail unavailable
+    try:
+        return json.loads(muted_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _parts_with_muting(sections, muted_data):
+    """
+    Return list of 1-based part indices whose time ranges overlap
+    with muted segments. If muted_data is empty (detail unavailable),
+    returns all part indices.
+    """
+    if not muted_data:
+        # No detail — assume all parts are muted
+        return list(range(1, len(sections) + 1))
+
+    def _hms_s(hms):
+        p = hms.split(":")
+        return int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
+
+    result = []
+    for i, sec in enumerate(sections):
+        if sec is None:
+            sec_start, sec_end = 0, float("inf")
+        else:
+            parts = sec.split("-")
+            sec_start = _hms_s(parts[0])
+            sec_end = float("inf") if parts[1] == "inf" else _hms_s(parts[1])
+        for seg in muted_data:
+            seg_start = seg["offset"]
+            seg_end = seg["offset"] + seg["duration"]
+            if seg_start < sec_end and seg_end > sec_start:
+                result.append(i + 1)
+                break
+    return result
+
+
 def _progress_bar(fraction, width=30):
     """Render a text progress bar like [████████░░░░░░░░]."""
     filled = int(width * fraction)
@@ -238,6 +343,71 @@ def api_post(url, max_retries=MAX_RETRIES, **kwargs):
             wait = BACKOFF ** attempt
             print(f"  Request error ({e}), retrying in {wait}s...")
             time.sleep(wait)
+
+
+# ===========================================================================
+# NobleJury Archive
+# ===========================================================================
+
+
+def fetch_noblejury_archive(streamer_names):
+    """
+    Fetch and parse the NobleJury MCYT archive listing.
+    Returns a list of dicts: {username, start_utc, size_bytes, url, filename}
+    Only returns entries matching one of the given streamer_names.
+
+    Handles server being slow/unresponsive with generous timeouts and retries.
+    """
+    lower_names = {n.lower() for n in streamer_names}
+    print("  Fetching NobleJury archive listing...")
+    try:
+        r = api_get(NOBLEJURY_URL, max_retries=3, timeout=60)
+    except Exception as e:
+        print(f"  Warning: could not fetch NobleJury archive: {e}")
+        return []
+
+    entries = []
+    # Each row: <a ... title="name-YYYY-MM-DDTHH:MM±HH:MM.ts">...</a>
+    #           <td class="size">2.4 GiB</td>
+    for m in re.finditer(
+        r'title="([^"]+\.ts)"[^<]*</a></td>\s*<td class="size">([^<]+)</td>',
+        r.text,
+    ):
+        filename = m.group(1)
+        size_str = m.group(2)
+
+        # Parse: streamername-YYYY-MM-DDTHH:MM±HH:MM.ts
+        fm = re.match(
+            r"(.+)-(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+-]\d{2}:\d{2})\.ts$",
+            filename,
+        )
+        if not fm:
+            continue
+
+        username = fm.group(1).lower()
+        if username not in lower_names:
+            continue
+
+        try:
+            dt = datetime.fromisoformat(fm.group(2))
+            dt_utc = dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+
+        url = NOBLEJURY_URL + urllib.parse.quote(filename)
+        entries.append({
+            "username": username,
+            "start_utc": dt_utc,
+            "size_bytes": _parse_size(size_str),
+            "url": url,
+            "filename": filename,
+        })
+
+    if entries:
+        print(f"  Found {len(entries)} relevant capture(s) on NobleJury.")
+    else:
+        print(f"  No matching captures on NobleJury.")
+    return entries
 
 
 # ===========================================================================
@@ -560,6 +730,10 @@ class VODTracker:
             return
         with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
             self.rows = list(csv.DictReader(f))
+        # Backward compat: ensure all current fields exist in old CSVs
+        for row in self.rows:
+            for field in CSV_FIELDS:
+                row.setdefault(field, "")
 
     def save(self):
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -571,6 +745,33 @@ class VODTracker:
     def known_urls(self):
         """Set of all Twitch stream URLs already in the tracker."""
         return {r["stream_url"] for r in self.rows if r.get("stream_url")}
+
+    def known_noblejury_urls(self):
+        """Set of all NobleJury URLs already in the tracker."""
+        return {r["noblejury_url"] for r in self.rows if r.get("noblejury_url")}
+
+    # ---- Stream identity helpers ------------------------------------------
+
+    @staticmethod
+    def _stream_id(r):
+        """
+        Unique stream identifier for day-order counting.
+        Deleted captures (no Twitch URL) use their noblejury_url.
+        Muted captures share the Twitch stream's identity.
+        """
+        if r.get("deleted") == "Yes":
+            return "nj:" + r.get("noblejury_url", "")
+        return r.get("stream_url", "")
+
+    @staticmethod
+    def _part_group_key(r):
+        """
+        Key for grouping rows that are parts of the same download.
+        Capture rows are grouped by noblejury_url (separate from Twitch parts).
+        """
+        if r.get("noblejury_url"):
+            return "nj:" + r["noblejury_url"]
+        return r.get("stream_url", "")
 
     # ---- Adding new videos ------------------------------------------------
 
@@ -589,10 +790,10 @@ class VODTracker:
         new_rows = []
         for v in videos:
             dt = datetime.fromisoformat(v["created_at"].replace("Z", "+00:00"))
-            date_str = dt.strftime("%Y-%m-%d")
             dur = parse_duration(v["duration"])
             if muted_reliable:
-                muted = "Yes" if v.get("muted_segments") else "No"
+                segs = v.get("muted_segments")
+                muted = json.dumps(segs) if segs else "No"
             else:
                 muted = ""  # unknown — app token can't report this
             sections = calc_sections(dur)
@@ -607,12 +808,15 @@ class VODTracker:
                         "upload_status": "",
                         "stream_datetime": v["created_at"],
                         "muted_segments": muted,
+                        "deleted": "",
                         "streamer_name": streamer,
                         "stream_title": v["title"],
                         "stream_url": v["url"],
+                        "noblejury_url": "",
                         "stream_duration": v["duration"],
                         "vod_section": sec or "",
                         "vod_filename": "",  # set by _recalc
+                        "noblejury_filename": "",
                         "vod_title": "",  # set by _recalc
                         "vod_description": make_description(
                             streamer, dt, v["title"], p, tp
@@ -626,53 +830,226 @@ class VODTracker:
         self.save()
         return new_rows
 
+    def add_deleted_capture(self, capture, streamer):
+        """
+        Add rows for a deleted VOD discovered via NobleJury capture.
+        Estimates duration from file size; sections are filled during download.
+        """
+        dt = capture["start_utc"]
+        est_duration = capture["size_bytes"] / BYTES_PER_SECOND_ESTIMATE
+        n_parts = max(1, math.ceil(est_duration / MAX_VOD_SECONDS))
+        title = "Captured Deleted Stream"
+
+        new_rows = []
+        for i in range(n_parts):
+            p = (i + 1) if n_parts > 1 else None
+            tp = n_parts if n_parts > 1 else None
+            new_rows.append({
+                "download_status": "",
+                "upload_status": "",
+                "stream_datetime": dt.isoformat(),
+                "muted_segments": "",
+                "deleted": "Yes",
+                "streamer_name": streamer,
+                "stream_title": title,
+                "stream_url": "",
+                "noblejury_url": capture["url"],
+                "stream_duration": "",
+                "vod_section": "",  # filled during download
+                "vod_filename": "",  # set by _recalc
+                "noblejury_filename": "",  # set by _recalc
+                "vod_title": "",  # set by _recalc
+                "vod_description": make_capture_description(
+                    streamer, dt, title, p, tp, is_deleted=True
+                ),
+                "vod_url": "",
+            })
+
+        self.rows.extend(new_rows)
+        self._recalc()
+        self.save()
+        print(f"    Added deleted capture: {capture['filename']} "
+              f"({n_parts} part(s))")
+        return new_rows
+
+    def add_muted_captures(self, capture, streamer, stream_url,
+                           twitch_video_data):
+        """
+        Add capture rows for a muted VOD that has a NobleJury capture.
+        Only adds rows for parts that actually contain muted segments.
+        """
+        muted_data = _parse_muted_segments(
+            twitch_video_data.get("_muted_str", "")
+        )
+        dur = parse_duration(twitch_video_data["duration"])
+        sections = calc_sections(dur)
+        muted_parts = _parts_with_muting(sections, muted_data)
+
+        if not muted_parts:
+            return []
+
+        dt = datetime.fromisoformat(
+            twitch_video_data["created_at"].replace("Z", "+00:00")
+        )
+        title = twitch_video_data["title"]
+
+        new_rows = []
+        n_cap_parts = len(muted_parts)
+        for cap_i, _part_num in enumerate(muted_parts):
+            p = (cap_i + 1) if n_cap_parts > 1 else None
+            tp = n_cap_parts if n_cap_parts > 1 else None
+            new_rows.append({
+                "download_status": "",
+                "upload_status": "",
+                "stream_datetime": twitch_video_data["created_at"],
+                "muted_segments": "",
+                "deleted": "",
+                "streamer_name": streamer,
+                "stream_title": title,
+                "stream_url": stream_url,
+                "noblejury_url": capture["url"],
+                "stream_duration": twitch_video_data["duration"],
+                "vod_section": "",  # filled during download
+                "vod_filename": "",  # set by _recalc
+                "noblejury_filename": "",  # set by _recalc
+                "vod_title": "",  # set by _recalc
+                "vod_description": make_capture_description(
+                    streamer, dt, title, p, tp, is_deleted=False
+                ),
+                "vod_url": "",
+            })
+
+        self.rows.extend(new_rows)
+        self._recalc()
+        self.save()
+        print(f"    Added muted capture: {capture['filename']} "
+              f"({n_cap_parts} part(s) for {len(muted_parts)} muted section(s))")
+        return new_rows
+
+    def update_capture_parts(self, noblejury_url, actual_duration_s):
+        """
+        After probing a capture's actual duration, adjust the number of
+        rows and fill in vod_sections.  Returns updated row indices.
+        """
+        indices = [i for i, r in enumerate(self.rows)
+                   if r.get("noblejury_url") == noblejury_url]
+        if not indices:
+            return []
+
+        sections = calc_sections(actual_duration_s)
+        needed = len(sections)
+        current = len(indices)
+
+        template = dict(self.rows[indices[0]])
+
+        if needed > current:
+            for i in range(needed - current):
+                new_row = dict(template)
+                new_row["vod_section"] = ""
+                new_row["download_status"] = ""
+                new_row["upload_status"] = ""
+                new_row["vod_url"] = ""
+                self.rows.insert(indices[-1] + 1 + i, new_row)
+        elif needed < current:
+            for i in range(current - needed):
+                idx = indices[current - 1 - i]
+                del self.rows[idx]
+
+        # Re-find indices after insertions/deletions
+        indices = [i for i, r in enumerate(self.rows)
+                   if r.get("noblejury_url") == noblejury_url]
+
+        # Fill in sections and duration
+        h = int(actual_duration_s // 3600)
+        m = int(actual_duration_s % 3600 // 60)
+        s = int(actual_duration_s % 60)
+        dur_str = f"{h}h{m}m{s}s"
+        for i, idx in enumerate(indices):
+            self.rows[idx]["vod_section"] = sections[i] or ""
+            self.rows[idx]["stream_duration"] = dur_str
+
+        self._recalc()
+        self.save()
+        return indices
+
+    def get_time_ranges(self, streamer):
+        """
+        Return list of (start_utc, end_utc) for all known Twitch VODs
+        by a streamer. Used to detect deleted VODs.
+        """
+        ranges = []
+        seen_urls = set()
+        for r in self.rows:
+            url = r.get("stream_url", "")
+            if (r["streamer_name"].lower() != streamer.lower()
+                    or not url or url in seen_urls):
+                continue
+            seen_urls.add(url)
+            try:
+                start = datetime.fromisoformat(
+                    r["stream_datetime"].replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            dur = parse_duration(r.get("stream_duration", ""))
+            if dur <= 0:
+                dur = MAX_VOD_SECONDS  # fallback
+            end = start + timedelta(seconds=dur)
+            ranges.append((start, end))
+        return ranges
+
     def _recalc(self):
         """
-        Recalculate vod_filename and vod_title for every row.
-        Handles day-order numbering (only shown when a streamer has
-        multiple streams on the same day) and part numbering for
-        split VODs. Renames already-downloaded files on disk if needed.
+        Recalculate vod_filename, noblejury_filename, vod_title, and
+        vod_description for every row.  Handles day-order numbering,
+        part numbering, and capture vs normal filename formats.
+        Renames already-downloaded files on disk if needed.
         """
-        # 1. Build day-order map: (streamer, date, url) -> (order, total)
-        #    Order is chronological among that streamer's unique streams
-        #    on that date.
-        day_map = defaultdict(dict)  # (streamer, date) -> {url: datetime_str}
+        # 1. Build day-order map using stream identity.
+        #    Muted captures share their Twitch stream's identity.
+        #    Deleted captures use their noblejury_url as identity.
+        day_map = defaultdict(dict)  # (streamer, date) -> {stream_id: dt_str}
         for r in self.rows:
             key = (r["streamer_name"], r["stream_datetime"][:10])
-            url = r["stream_url"]
-            if url not in day_map[key]:
-                day_map[key][url] = r["stream_datetime"]
+            sid = self._stream_id(r)
+            if sid not in day_map[key]:
+                day_map[key][sid] = r["stream_datetime"]
 
-        order_map = {}  # (streamer, date, url) -> (order, day_total)
-        for (streamer, date), url_times in day_map.items():
-            sorted_urls = [
-                u for u, _ in sorted(url_times.items(), key=lambda x: x[1])
+        order_map = {}  # (streamer, date, stream_id) -> (order, day_total)
+        for (streamer, date), id_times in day_map.items():
+            sorted_ids = [
+                s for s, _ in sorted(id_times.items(), key=lambda x: x[1])
             ]
-            total = len(sorted_urls)
-            for idx, url in enumerate(sorted_urls):
-                order_map[(streamer, date, url)] = (idx + 1, total)
+            total = len(sorted_ids)
+            for idx, sid in enumerate(sorted_ids):
+                order_map[(streamer, date, sid)] = (idx + 1, total)
 
-        # 2. Group row indices by stream_url to find part ordering.
-        #    Rows for the same stream_url appear in insertion order,
-        #    which matches part order.
-        url_indices = defaultdict(list)
+        # 2. Group row indices by part_group_key for part ordering.
+        part_groups = defaultdict(list)
         for i, r in enumerate(self.rows):
-            url_indices[r["stream_url"]].append(i)
+            part_groups[self._part_group_key(r)].append(i)
 
         # 3. Update each row.
-        for url, indices in url_indices.items():
+        for _pgk, indices in part_groups.items():
             n_parts = len(indices)
             for part_i, row_i in enumerate(indices):
                 r = self.rows[row_i]
                 streamer = r["streamer_name"]
                 date = r["stream_datetime"][:10]
-                order, day_total = order_map[(streamer, date, url)]
+                sid = self._stream_id(r)
+                order, day_total = order_map[(streamer, date, sid)]
 
                 p = (part_i + 1) if n_parts > 1 else None
                 tp = n_parts if n_parts > 1 else None
+                is_capture = bool(r.get("noblejury_url"))
 
                 old_fn = r["vod_filename"]
-                new_fn = make_filename(date, streamer, order, day_total, p, tp)
+                if is_capture:
+                    new_fn = make_capture_filename(
+                        date, streamer, order, day_total, p, tp)
+                else:
+                    new_fn = make_filename(
+                        date, streamer, order, day_total, p, tp)
 
                 # Rename file on disk if it was already downloaded
                 if old_fn and old_fn != new_fn:
@@ -683,17 +1060,29 @@ class VODTracker:
                         print(f"  Renamed: {old_fn} -> {new_fn}")
 
                 r["vod_filename"] = new_fn
+                r["noblejury_filename"] = new_fn if is_capture else ""
+
+                # Title — add "(unmuted capture)" for non-deleted captures
+                display_title = r["stream_title"]
+                if is_capture and r.get("deleted") != "Yes":
+                    display_title += " (unmuted capture)"
                 r["vod_title"] = make_title(
-                    date, streamer, order, day_total, p, tp, r["stream_title"]
+                    date, streamer, order, day_total, p, tp, display_title
                 )
 
-                # Refresh description too, in case part numbering changed
+                # Description
                 dt = datetime.fromisoformat(
                     r["stream_datetime"].replace("Z", "+00:00")
                 )
-                r["vod_description"] = make_description(
-                    streamer, dt, r["stream_title"], p, tp
-                )
+                if is_capture:
+                    r["vod_description"] = make_capture_description(
+                        streamer, dt, r["stream_title"], p, tp,
+                        is_deleted=(r.get("deleted") == "Yes"),
+                    )
+                else:
+                    r["vod_description"] = make_description(
+                        streamer, dt, r["stream_title"], p, tp
+                    )
 
     # ---- Field updates ----------------------------------------------------
 
@@ -833,6 +1222,187 @@ def download_vod(ytdlp, url, output_path, section=None, best_quality=False):
 
 
 # ===========================================================================
+# NobleJury Capture Download / Convert
+# ===========================================================================
+
+
+def _find_tool(ytdlp_path, name):
+    """Find ffmpeg/ffprobe next to yt-dlp or in PATH."""
+    ytdlp_dir = Path(ytdlp_path).parent
+    for suffix in [name, f"{name}.exe"]:
+        candidate = ytdlp_dir / suffix
+        if candidate.exists():
+            return str(candidate)
+    return name  # hope it's in PATH
+
+
+def probe_duration(filepath, ytdlp_path="ffprobe"):
+    """Get video duration in seconds using ffprobe. Returns float or None."""
+    ffprobe = _find_tool(ytdlp_path, "ffprobe")
+    cmd = [
+        ffprobe, "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return None
+
+
+def download_capture_file(url, output_path):
+    """
+    Download a file from a URL (NobleJury) with progress bar and retry.
+    Uses generous timeouts since the server can be slow.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, stream=True, timeout=(30, 300))
+            r.raise_for_status()
+            total = int(r.headers.get("content-length", 0))
+
+            downloaded = 0
+            start = time.time()
+            with open(output_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    elapsed = time.time() - start
+                    if total > 0 and elapsed > 0:
+                        pct = downloaded / total
+                        speed = downloaded / elapsed
+                        if pct > 0.001:
+                            eta = elapsed / pct * (1 - pct)
+                        else:
+                            eta = 0
+                        bar = _progress_bar(pct)
+                        speed_str = f"{speed / 1024 / 1024:.1f} MiB/s"
+                        print(
+                            f"\r    {bar} {int(pct * 100):3d}%  "
+                            f"at {speed_str}  ETA: {_format_eta(eta)}       ",
+                            end="", flush=True,
+                        )
+
+            elapsed = time.time() - start
+            print(f"\r    {_progress_bar(1.0)} 100%  "
+                  f"({_format_eta(elapsed)} elapsed)          ")
+            return True
+        except requests.exceptions.RequestException as e:
+            if attempt < MAX_RETRIES - 1:
+                wait = BACKOFF ** (attempt + 1)
+                print(f"\n    Download error ({e}), retrying in {wait}s...")
+                time.sleep(wait)
+                # Remove partial file
+                if Path(output_path).exists():
+                    Path(output_path).unlink()
+            else:
+                print(f"\n    Failed to download after {MAX_RETRIES} "
+                      f"attempts: {e}")
+                return False
+    return False
+
+
+def convert_ts_to_mp4(input_path, output_path, ytdlp_path="ffmpeg",
+                      estimated_duration=None):
+    """
+    Convert a .ts capture to .mp4 via ffmpeg (re-encode, not stream copy).
+    Shows a progress bar. Returns True on success.
+    """
+    ffmpeg = _find_tool(ytdlp_path, "ffmpeg")
+
+    # Get duration for progress bar if not estimated
+    if not estimated_duration:
+        estimated_duration = probe_duration(input_path, ytdlp_path)
+
+    cmd = [
+        ffmpeg, "-i", str(input_path),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-y",
+        str(output_path),
+    ]
+
+    print(f"    ffmpeg command: {' '.join(cmd)}")
+    start_time = time.time()
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        showed_bar = False
+        for line in proc.stdout:
+            m = re.search(
+                r"time=(\d+):(\d+):([\d.]+).*?speed=\s*([\d.]+)x", line
+            )
+            if m and estimated_duration and estimated_duration > 0:
+                cur = (int(m.group(1)) * 3600 + int(m.group(2)) * 60
+                       + float(m.group(3)))
+                speed_x = float(m.group(4))
+                pct = min(cur / estimated_duration, 1.0)
+                remaining = ((estimated_duration - cur)
+                             / max(speed_x, 0.01))
+                bar = _progress_bar(pct)
+                print(f"\r    {bar} {int(pct * 100):3d}%  "
+                      f"at {m.group(4)}x  "
+                      f"ETA: {_format_eta(remaining)}       ",
+                      end="", flush=True)
+                showed_bar = True
+
+        proc.wait(timeout=86400)  # 24h timeout for long encodes
+        if showed_bar:
+            elapsed = time.time() - start_time
+            if proc.returncode == 0:
+                print(f"\r    {_progress_bar(1.0)} 100%  "
+                      f"({_format_eta(elapsed)} elapsed)          ")
+            else:
+                print()
+        if proc.returncode != 0:
+            print(f"    ffmpeg conversion failed (exit {proc.returncode}).")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print("\n    ffmpeg timed out.")
+        return False
+    except FileNotFoundError:
+        print(f"    Error: ffmpeg not found. Install it or place it next "
+              f"to yt-dlp.")
+        return False
+
+
+def split_capture(input_path, section, output_path, ytdlp_path="ffmpeg"):
+    """Split a section from an mp4 using ffmpeg -c copy."""
+    ffmpeg = _find_tool(ytdlp_path, "ffmpeg")
+    parts = section.split("-")
+    start = parts[0]
+    end = parts[1] if len(parts) > 1 else "inf"
+
+    cmd = [ffmpeg, "-i", str(input_path), "-ss", start]
+    if end != "inf":
+        cmd += ["-to", end]
+    cmd += ["-c", "copy", "-y", str(output_path)]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=14400
+        )
+        if result.returncode != 0:
+            print(f"    Split error: {result.stderr[-500:]}")
+            return False
+        return True
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"    Split failed: {e}")
+        return False
+
+
+# ===========================================================================
 # YouTube Uploader
 # ===========================================================================
 
@@ -869,8 +1439,13 @@ class YouTubeUploader:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 print("Refreshing YouTube token...")
-                creds.refresh(GoogleAuthRequest())
-            else:
+                try:
+                    creds.refresh(GoogleAuthRequest())
+                except Exception:
+                    print("  Token expired or revoked; re-authorizing...")
+                    os.remove(self.token_file)
+                    creds = None
+            if not creds or not creds.valid:
                 if not os.path.exists(self.secrets):
                     print(f"Error: client_secrets file '{self.secrets}' not found.")
                     print("See config.example.ini for YouTube setup instructions.")
@@ -1031,10 +1606,21 @@ def step_update(config, channels, twitch):
     print("\n=== Updating VOD trackers ===")
     grouped = group_by_folder(channels)
 
+    # Fetch NobleJury archive once for all channels
+    all_usernames = [ch["username"] for ch in channels]
+    nj_entries = fetch_noblejury_archive(all_usernames)
+    # Index by lowercase username
+    nj_by_user = defaultdict(list)
+    for e in nj_entries:
+        nj_by_user[e["username"].lower()].append(e)
+
     for folder, chs in grouped.items():
         print(f"\nFolder: {folder}")
         tracker = VODTracker(folder)
         known = tracker.known_urls()
+
+        # Keep video data in memory for muted capture detection
+        all_new_vids = {}  # stream_url -> video dict (with _muted_str)
 
         for ch in chs:
             uname = ch["username"]
@@ -1049,16 +1635,95 @@ def step_update(config, channels, twitch):
 
             if not new_vids:
                 print(f"    No new VODs.")
-                continue
+            else:
+                print(f"    Found {len(new_vids)} new VOD(s).")
+                added = tracker.add_videos(new_vids, uname,
+                                           muted_reliable=twitch.has_user_token)
+                known = tracker.known_urls()
 
-            print(f"    Found {len(new_vids)} new VOD(s).")
-            added = tracker.add_videos(new_vids, uname,
-                                       muted_reliable=twitch.has_user_token)
-            known = tracker.known_urls()
+                for row in added:
+                    if _has_muting(row.get("muted_segments", "")):
+                        print(f"    WARNING: Muted segments in: "
+                              f"{row['stream_url']}")
 
-            for row in added:
-                if row.get("muted_segments") == "Yes":
-                    print(f"    WARNING: Muted segments in: {row['stream_url']}")
+                # Save video data for muted capture matching
+                for v in new_vids:
+                    muted_str = ""
+                    if twitch.has_user_token:
+                        segs = v.get("muted_segments")
+                        muted_str = json.dumps(segs) if segs else "No"
+                    v["_muted_str"] = muted_str
+                    all_new_vids[v["url"]] = v
+
+            # --- NobleJury: detect deleted VODs ---
+            captures = nj_by_user.get(uname.lower(), [])
+            if captures:
+                known_nj = tracker.known_noblejury_urls()
+                time_ranges = tracker.get_time_ranges(uname)
+
+                for cap in captures:
+                    if cap["url"] in known_nj:
+                        continue
+                    cap_start = cap["start_utc"]
+                    # Check if this capture falls within any known VOD
+                    covered = False
+                    for vod_start, vod_end in time_ranges:
+                        if vod_start <= cap_start <= vod_end:
+                            covered = True
+                            break
+                    if not covered:
+                        tracker.add_deleted_capture(cap, uname)
+
+            # --- NobleJury: detect muted VOD captures ---
+            if captures:
+                known_nj = tracker.known_noblejury_urls()
+                time_ranges = tracker.get_time_ranges(uname)
+
+                for row in tracker.rows:
+                    if (row["streamer_name"].lower() != uname.lower()
+                            or not _has_muting(row.get("muted_segments", ""))
+                            or not row.get("stream_url")):
+                        continue
+                    # Check if capture rows already exist for this stream
+                    stream_url = row["stream_url"]
+                    has_capture = any(
+                        r.get("noblejury_url") and r.get("stream_url") == stream_url
+                        for r in tracker.rows
+                    )
+                    if has_capture:
+                        continue
+
+                    # Find a matching capture
+                    try:
+                        vod_start = datetime.fromisoformat(
+                            row["stream_datetime"].replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    dur = parse_duration(row.get("stream_duration", ""))
+                    if dur <= 0:
+                        continue
+                    vod_end = vod_start + timedelta(seconds=dur)
+
+                    for cap in captures:
+                        if cap["url"] in known_nj:
+                            continue
+                        if vod_start <= cap["start_utc"] <= vod_end:
+                            # Build video data dict for muted capture
+                            vid_data = all_new_vids.get(stream_url)
+                            if not vid_data:
+                                vid_data = {
+                                    "created_at": row["stream_datetime"],
+                                    "title": row["stream_title"],
+                                    "duration": row["stream_duration"],
+                                    "_muted_str": row.get(
+                                        "muted_segments", ""),
+                                }
+                            tracker.add_muted_captures(
+                                cap, uname, stream_url, vid_data
+                            )
+                            known_nj = tracker.known_noblejury_urls()
+                            break
 
         print(f"  Tracker saved: {tracker.csv_path}")
 
@@ -1073,6 +1738,86 @@ def _clean_path(raw):
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         s = s[1:-1]
     return s
+
+
+def _download_capture_group(tracker, nj_url, ytdlp_path):
+    """
+    Download and process a NobleJury capture for all its parts.
+    Downloads the .ts, converts to .mp4, probes duration, adjusts parts,
+    and splits if needed.
+    """
+    indices = [i for i, r in enumerate(tracker.rows)
+               if r.get("noblejury_url") == nj_url and not r["download_status"]]
+    if not indices:
+        return
+
+    first_row = tracker.rows[indices[0]]
+    fn = first_row["vod_filename"]
+
+    # Build base name (strip part info) for the .ts and unsplit .mp4
+    base = re.sub(r" - part_\d+_of_\d+", "", fn)
+    ts_name = base.replace(" - capture.mp4", " - capture.ts")
+    mp4_full_name = base  # e.g. "2026-03-20 - streamer - capture.mp4"
+
+    ts_path = tracker.folder / ts_name
+    mp4_full_path = tracker.folder / mp4_full_name
+
+    # 1. Download .ts from NobleJury
+    if not ts_path.exists():
+        print(f"  Downloading capture: {ts_name}")
+        if not download_capture_file(nj_url, ts_path):
+            print(f"    FAILED to download capture.")
+            return
+    else:
+        print(f"  Capture .ts already exists: {ts_name}")
+
+    # 2. Convert .ts to .mp4 (re-encode — not stream copy)
+    if not mp4_full_path.exists():
+        print(f"  Converting: {ts_name} -> {mp4_full_name}")
+        if not convert_ts_to_mp4(ts_path, mp4_full_path,
+                                 ytdlp_path=ytdlp_path):
+            print(f"    FAILED to convert capture.")
+            return
+    else:
+        print(f"  Capture .mp4 already exists: {mp4_full_name}")
+
+    # 3. Probe actual duration
+    duration = probe_duration(mp4_full_path, ytdlp_path)
+    if not duration:
+        print(f"    Could not determine duration of {mp4_full_name}.")
+        return
+    print(f"    Duration: {to_hhmmss(int(duration))}")
+
+    # 4. Update CSV with actual duration and parts
+    indices = tracker.update_capture_parts(nj_url, duration)
+    if not indices:
+        return
+
+    # 5. If multiple parts, split
+    n_parts = len(indices)
+    if n_parts > 1:
+        print(f"  Splitting {mp4_full_name} into {n_parts} parts...")
+        for idx in indices:
+            row = tracker.rows[idx]
+            section = row["vod_section"]
+            part_path = tracker.folder / row["vod_filename"]
+            if not part_path.exists():
+                print(f"    Splitting: {row['vod_filename']}")
+                if not split_capture(mp4_full_path, section, part_path,
+                                     ytdlp_path=ytdlp_path):
+                    print(f"    FAILED to split: {row['vod_filename']}")
+                    return
+    elif n_parts == 1:
+        # Single part — rename the full mp4 to the final filename
+        final_path = tracker.folder / tracker.rows[indices[0]]["vod_filename"]
+        if mp4_full_path != final_path:
+            if not final_path.exists():
+                mp4_full_path.rename(final_path)
+
+    # 6. Mark all parts as Saved
+    for idx in indices:
+        tracker.set_field(idx, "download_status", "Saved")
+    print(f"    Capture processed successfully.")
 
 
 def step_download(config, channels, best_quality=False):
@@ -1097,21 +1842,34 @@ def step_download(config, channels, best_quality=False):
 
         print(f"\n  {folder}: {len(pending)} VOD(s) to download.")
 
+        # --- Normal (non-capture) downloads ---
         for idx, row in pending:
+            if row.get("noblejury_url"):
+                continue  # handled below as capture group
             fn = row["vod_filename"]
             out = tracker.folder / fn
             section = row["vod_section"] or None
             url = row["stream_url"]
 
-            if row["muted_segments"] == "Yes":
+            if _has_muting(row.get("muted_segments", "")):
                 print(f"  WARNING: '{fn}' has muted segments.")
 
             print(f"  Downloading: {fn}")
-            if download_vod(ytdlp, url, out, section, best_quality=best_quality):
+            if download_vod(ytdlp, url, out, section,
+                            best_quality=best_quality):
                 tracker.set_field(idx, "download_status", "Saved")
                 print(f"    Saved.")
             else:
                 print(f"    FAILED to download {fn}.")
+
+        # --- Capture downloads (grouped by noblejury_url) ---
+        seen_nj = set()
+        for _idx, row in pending:
+            nj_url = row.get("noblejury_url")
+            if not nj_url or nj_url in seen_nj:
+                continue
+            seen_nj.add(nj_url)
+            _download_capture_group(tracker, nj_url, ytdlp)
 
 
 def step_upload(config, channels, open_browser=True, reauth=False,
@@ -1188,6 +1946,9 @@ def step_upload(config, channels, open_browser=True, reauth=False,
             # Convert stream datetime to ISO 8601 for recordingDate
             recording_date = row["stream_datetime"]
 
+            # Deleted VODs upload as private (may contain sensitive content)
+            privacy = "private" if row.get("deleted") == "Yes" else "unlisted"
+
             try:
                 vid_id = yt.upload(
                     str(filepath),
@@ -1195,6 +1956,7 @@ def step_upload(config, channels, open_browser=True, reauth=False,
                     row["vod_description"],
                     recording_date=recording_date,
                     audio_language=audio_lang,
+                    privacy=privacy,
                 )
                 if not vid_id:
                     print(f"    FAILED to upload {fn}.")
@@ -1261,7 +2023,8 @@ def main():
     parser.add_argument(
         "--reauth",
         action="store_true",
-        help="Force YouTube re-authorization (use if uploading to the wrong channel)",
+        help="Force YouTube re-authorization (use if uploading to the wrong channel "
+             "or if your token has expired)",
     )
     parser.add_argument(
         "--config", default="config.ini", help="Path to config file (default: config.ini)"
@@ -1303,9 +2066,12 @@ def main():
                 raise
             except Exception as e:
                 print(f"  YouTube auth failed: {e}")
-                if not will_download:
+                if not run_all:
+                    # User explicitly asked for --upload, so fail
                     sys.exit(1)
-                print("  Continuing with update/download steps...")
+                print("  Skipping upload step; run with --upload to "
+                      "re-authorize.")
+                will_upload = False
 
     if run_all or args.update:
         twitch = TwitchAPI(
